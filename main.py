@@ -488,7 +488,7 @@ def health() -> dict[str, Any]:
         "status": "ok",
         "version": "1.3.0",
         "colorSpace": "CMYK",
-        "cmykProfile": OUTPUT_PROFILE_NAME,
+        "cmykProfile": " ".join(OUTPUT_PROFILE_NAME.split()),
         "renderingIntent": CMYK_RENDERING_INTENT_NAME,
         "allowedImageHosts": sorted(ALLOWED_IMAGE_HOSTS),
         "persistentFileStorage": False,
@@ -588,7 +588,7 @@ async def generate_from_urls(
             ),
             "X-Bleed-MM": f"{body.bleedMm:.2f}",
             "X-Color-Space": "CMYK",
-            "X-CMYK-Profile": OUTPUT_PROFILE_NAME,
+            "X-CMYK-Profile": " ".join(OUTPUT_PROFILE_NAME.split()),
             "X-Persistent-File-Storage": "false",
         },
     )
