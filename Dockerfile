@@ -1,9 +1,13 @@
-API_TOKEN=replace-with-a-long-random-token
-MAX_PAGES=100
-MAX_FILE_MB=30
-MIN_DPI=299
-DOWNLOAD_TIMEOUT=60
-ALLOWED_IMAGE_HOSTS=hcti.io
-CMYK_PROFILE_PATH=/app/profiles/FOGRA39L_coated.icc
-CMYK_RENDERING_INTENT=perceptual
-CMYK_JPEG_QUALITY=100
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY main.py .
+COPY profiles ./profiles
+
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
