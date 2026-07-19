@@ -2,25 +2,28 @@
 import io
 import ipaddress
 import os
+import re
 import secrets
 import socket
+import zipfile
 from typing import Any
 from urllib.parse import urlparse
 
 import fitz  # PyMuPDF
 import httpx
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import Response
 from PIL import Image, ImageCms, UnidentifiedImageError
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Print PDF Service", version="1.3.0")
+app = FastAPI(title="Print PDF Service", version="1.4.0")
 
 MM_TO_PT = 72.0 / 25.4
 
 API_TOKEN = os.environ.get("API_TOKEN", "").strip()
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "100"))
 MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "30"))
+MAX_ZIP_MB = int(os.environ.get("MAX_ZIP_MB", "100"))
 MIN_DPI = float(os.environ.get("MIN_DPI", "299"))
 DOWNLOAD_TIMEOUT = float(os.environ.get("DOWNLOAD_TIMEOUT", "60"))
 
@@ -461,7 +464,7 @@ def make_pdf(
             {
                 "title": safe_name,
                 "producer": (
-                    "Print PDF Service 1.3 - CMYK FOGRA39"
+                    "Print PDF Service 1.4 - CMYK FOGRA39"
                 ),
                 "creator": "Print PDF Service",
                 "keywords": (
@@ -482,11 +485,176 @@ def make_pdf(
     return result, minimum_detected_dpi
 
 
+
+PAGE_FILE_RE = re.compile(r"^page_(\d{2,3})\.(png|jpe?g)$", re.IGNORECASE)
+
+
+def read_pages_from_zip(zip_bytes: bytes) -> list[tuple[PageInput, bytes]]:
+    if not zip_bytes:
+        raise HTTPException(status_code=400, detail="Empty ZIP body")
+
+    max_zip_bytes = MAX_ZIP_MB * 1024 * 1024
+    if len(zip_bytes) > max_zip_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"ZIP exceeds {MAX_ZIP_MB} MB",
+        )
+
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=400, detail="Invalid ZIP file") from exc
+
+    with archive:
+        entries: list[tuple[int, str, zipfile.ZipInfo]] = []
+        seen_numbers: set[int] = set()
+        total_uncompressed = 0
+        max_total_uncompressed = MAX_PAGES * MAX_FILE_MB * 1024 * 1024
+
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+
+            # Ignore folders and system metadata such as __MACOSX.
+            base_name = os.path.basename(info.filename)
+            match = PAGE_FILE_RE.fullmatch(base_name)
+            if not match:
+                continue
+
+            page_number = int(match.group(1))
+            if page_number in seen_numbers:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Duplicate page number: {page_number}",
+                )
+
+            if info.file_size > MAX_FILE_MB * 1024 * 1024:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"{base_name} exceeds {MAX_FILE_MB} MB",
+                )
+
+            total_uncompressed += info.file_size
+            if total_uncompressed > max_total_uncompressed:
+                raise HTTPException(
+                    status_code=413,
+                    detail="ZIP uncompressed content is too large",
+                )
+
+            seen_numbers.add(page_number)
+            entries.append((page_number, base_name, info))
+
+        if not entries:
+            raise HTTPException(
+                status_code=400,
+                detail="ZIP contains no page_01.png, page_02.png... files",
+            )
+
+        if len(entries) > MAX_PAGES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Too many pages. Maximum: {MAX_PAGES}",
+            )
+
+        entries.sort(key=lambda item: item[0])
+        actual_numbers = [number for number, _, _ in entries]
+        expected_numbers = list(range(1, len(entries) + 1))
+        if actual_numbers != expected_numbers:
+            missing = sorted(set(expected_numbers) - set(actual_numbers))
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Page numbering must be continuous from 1. "
+                    f"Received: {actual_numbers}; missing: {missing}"
+                ),
+            )
+
+        pages: list[tuple[PageInput, bytes]] = []
+        for page_number, base_name, info in entries:
+            data = archive.read(info)
+            pages.append(
+                (
+                    PageInput(
+                        number=page_number,
+                        url="",
+                        fileName=base_name,
+                    ),
+                    data,
+                )
+            )
+
+        return pages
+
+
+def pdf_response(
+    pdf_bytes: bytes,
+    page_count: int,
+    minimum_dpi: float,
+    page_mm: float,
+    trim_mm: float,
+    bleed_mm: float,
+    output_name: str,
+) -> Response:
+    safe_name = os.path.basename(output_name).strip() or "ksiazka_print_cmyk.pdf"
+    if not safe_name.lower().endswith(".pdf"):
+        safe_name += ".pdf"
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_name}"',
+            "X-Page-Count": str(page_count),
+            "X-Min-Effective-DPI": f"{minimum_dpi:.2f}",
+            "X-Media-Size-MM": f"{page_mm:.2f}x{page_mm:.2f}",
+            "X-Trim-Size-MM": f"{trim_mm:.2f}x{trim_mm:.2f}",
+            "X-Bleed-MM": f"{bleed_mm:.2f}",
+            "X-Color-Space": "CMYK",
+            "X-CMYK-Profile": " ".join(OUTPUT_PROFILE_NAME.split()),
+            "X-Persistent-File-Storage": "false",
+        },
+    )
+
+
+@app.post("/generate-from-zip")
+async def generate_from_zip(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    pageMm: float = 214.0,
+    trimMm: float = 210.0,
+    bleedMm: float = 2.0,
+    outputName: str = "ksiazka_print_cmyk.pdf",
+) -> Response:
+    check_auth(authorization)
+    validate_dimensions(pageMm, trimMm, bleedMm)
+
+    zip_bytes = await request.body()
+    pages = read_pages_from_zip(zip_bytes)
+
+    pdf_bytes, minimum_dpi = make_pdf(
+        images=pages,
+        page_mm=pageMm,
+        trim_mm=trimMm,
+        bleed_mm=bleedMm,
+        output_name=outputName,
+    )
+
+    return pdf_response(
+        pdf_bytes=pdf_bytes,
+        page_count=len(pages),
+        minimum_dpi=minimum_dpi,
+        page_mm=pageMm,
+        trim_mm=trimMm,
+        bleed_mm=bleedMm,
+        output_name=outputName,
+    )
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {
         "status": "ok",
-        "version": "1.3.0",
+        "version": "1.4.0",
         "colorSpace": "CMYK",
         "cmykProfile": " ".join(OUTPUT_PROFILE_NAME.split()),
         "renderingIntent": CMYK_RENDERING_INTENT_NAME,
